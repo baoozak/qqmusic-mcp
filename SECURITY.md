@@ -18,6 +18,10 @@ real QQ Music Cookie or MCP bearer token.
 - Standard stdio mode does not expose a network port.
 - QQ Music login Cookies are encrypted with Windows DPAPI for the current user.
 - Cookies and bearer tokens are excluded from logs and MCP responses.
+- The installer downloads wheels only from this repository's latest GitHub
+  Release and verifies the accompanying SHA-256 before installation.
+- Browser login is validated against QQ Music before the encrypted session is
+  saved; the installer never receives or prints the Cookie.
 - A write probe must succeed before a plan can be applied.
 - Finalized plans are integrity checked with SHA-256.
 - The liked playlist (`dirId=201`) is never a write or delete target.

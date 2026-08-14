@@ -18,7 +18,7 @@ from typing import Any
 import uvicorn
 
 from .organizer import Organizer
-from .qqmusic import AuthenticationError, QQMusicClient, parse_cookie
+from .qqmusic import AuthenticationError, QQMusicClient, QQMusicError, parse_cookie
 from .server import build_mcp
 from .session_cache import delete_cookie, load_cookie, save_cookie
 from .storage import Storage, default_data_dir
@@ -48,6 +48,23 @@ class BearerAuth:
         await self.app(scope, receive, send)
 
 
+def _capture_login_cookie(timeout: int) -> str:
+    from .browser_auth import capture_qqmusic_cookie
+
+    return capture_qqmusic_cookie(timeout)
+
+
+def _validate_session(raw_cookie: str) -> int:
+    async def validate() -> int:
+        client = QQMusicClient(raw_cookie)
+        try:
+            return len(await client.list_created_playlists())
+        finally:
+            await client.close()
+
+    return asyncio.run(validate())
+
+
 def _create_organizer(args: argparse.Namespace) -> tuple[Organizer, QQMusicClient]:
     cache_path = default_data_dir() / "session.dpapi"
     raw_cookie: str | None = None
@@ -59,10 +76,8 @@ def _create_organizer(args: argparse.Namespace) -> tuple[Organizer, QQMusicClien
     if args.manual_cookie:
         raw_cookie = getpass.getpass("Paste QQ Music Cookie (hidden, memory only): ").strip()
     elif raw_cookie is None:
-        from .browser_auth import capture_qqmusic_cookie
-
         try:
-            raw_cookie = capture_qqmusic_cookie(args.login_timeout)
+            raw_cookie = _capture_login_cookie(args.login_timeout)
         except (RuntimeError, TimeoutError, ValueError) as error:
             raise StartupError(f"Automatic QQ Music login failed: {error}") from error
         save_cookie(cache_path, raw_cookie)
@@ -77,9 +92,7 @@ def _create_organizer(args: argparse.Namespace) -> tuple[Organizer, QQMusicClien
         except AuthenticationError:
             asyncio.run(client.close())
             delete_cookie(cache_path)
-            from .browser_auth import capture_qqmusic_cookie
-
-            raw_cookie = capture_qqmusic_cookie(args.login_timeout)
+            raw_cookie = _capture_login_cookie(args.login_timeout)
             save_cookie(cache_path, raw_cookie)
             client = QQMusicClient(raw_cookie)
     storage = Storage()
@@ -252,6 +265,129 @@ def logout(_: argparse.Namespace) -> int:
     return 0
 
 
+def login(args: argparse.Namespace) -> int:
+    cache_path = default_data_dir() / "session.dpapi"
+    if not args.force:
+        try:
+            cached = load_cookie(cache_path)
+            if cached is not None:
+                parse_cookie(cached)
+                _validate_session(cached)
+                print("QQ Music login is already valid.")
+                return 0
+        except AuthenticationError:
+            delete_cookie(cache_path)
+        except (OSError, UnicodeDecodeError, RuntimeError, ValueError):
+            delete_cookie(cache_path)
+        except QQMusicError as error:
+            print(f"Could not validate the saved QQ Music login: {error}", file=sys.stderr)
+            return 2
+    else:
+        delete_cookie(cache_path)
+    try:
+        raw_cookie = _capture_login_cookie(args.login_timeout)
+        parse_cookie(raw_cookie)
+        playlist_count = _validate_session(raw_cookie)
+        save_cookie(cache_path, raw_cookie)
+    except (AuthenticationError, OSError, QQMusicError, RuntimeError, TimeoutError, ValueError) as error:
+        print(f"QQ Music login failed: {error}", file=sys.stderr)
+        return 2
+    print(f"QQ Music login saved securely. Accessible playlists: {playlist_count}.")
+    return 0
+
+
+def _installed_browser() -> str | None:
+    names = ("chrome.exe", "msedge.exe")
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return str(Path(found).resolve())
+    roots = [os.environ.get("LOCALAPPDATA"), os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")]
+    relative_paths = (
+        Path("Google/Chrome/Application/chrome.exe"),
+        Path("Microsoft/Edge/Application/msedge.exe"),
+    )
+    for root in roots:
+        if not root:
+            continue
+        for relative in relative_paths:
+            candidate = Path(root) / relative
+            if candidate.is_file():
+                return str(candidate.resolve())
+    return None
+
+
+def _resolved_command(command: str) -> Path | None:
+    candidate = Path(command)
+    if candidate.is_file():
+        return candidate.resolve()
+    found = shutil.which(command)
+    return Path(found).resolve() if found else None
+
+
+def _codex_registration_status(command: str) -> str:
+    codex = shutil.which("codex")
+    if not codex:
+        return "unavailable"
+    result = subprocess.run(
+        [codex, "mcp", "get", "qqmusic-mcp", "--json"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode:
+        return "missing"
+    try:
+        registration = json.loads(result.stdout)
+        transport = registration.get("transport")
+        registered_command = transport.get("command") if isinstance(transport, dict) else None
+        registered_args = transport.get("args") if isinstance(transport, dict) else None
+        transport_type = transport.get("type") if isinstance(transport, dict) else None
+    except (AttributeError, json.JSONDecodeError):
+        return "invalid"
+    expected = _resolved_command(command)
+    registered = _resolved_command(registered_command) if isinstance(registered_command, str) else None
+    if transport_type != "stdio" or registered_args != ["stdio"] or expected != registered:
+        return "mismatch"
+    return "registered"
+
+
+def doctor(args: argparse.Namespace) -> int:
+    command = _command()
+    command_path = _resolved_command(command)
+    command_ready = command_path is not None
+    browser = _installed_browser()
+    session = "missing"
+    try:
+        raw_cookie = load_cookie(default_data_dir() / "session.dpapi")
+        if raw_cookie is not None:
+            parse_cookie(raw_cookie)
+            _validate_session(raw_cookie)
+            session = "valid"
+    except AuthenticationError:
+        session = "expired"
+    except (OSError, QQMusicError, RuntimeError, UnicodeDecodeError, ValueError):
+        session = "invalid"
+
+    client_status = "manual"
+    if args.client == "codex":
+        client_status = _codex_registration_status(command)
+
+    report = {
+        "windows": os.name == "nt",
+        "command": str(command_path) if command_ready else None,
+        "browser": browser,
+        "session": session,
+        "client": args.client,
+        "client_status": client_status,
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    required = [report["windows"], command_ready, browser is not None, session == "valid"]
+    if args.client == "codex":
+        required.append(client_status == "registered")
+    return 0 if all(required) else 1
+
+
 def config(args: argparse.Namespace) -> int:
     command = _command()
     server = {"command": command, "args": ["stdio"]}
@@ -268,14 +404,28 @@ def install(args: argparse.Namespace) -> int:
         config(argparse.Namespace(client=args.client))
         print("Add the configuration above to your MCP client.", file=sys.stderr)
         return 0
+    codex = shutil.which("codex")
+    if not codex:
+        print("Could not register Codex because the 'codex' command is not on PATH.", file=sys.stderr)
+        return 2
     for name in ("qqmusic-organizer", "qqmusic-mcp"):
-        subprocess.run(["codex", "mcp", "remove", name], capture_output=True, check=False)
-    result = subprocess.run(["codex", "mcp", "add", "qqmusic-mcp", "--", _command(), "stdio"])
+        subprocess.run([codex, "mcp", "remove", name], capture_output=True, check=False)
+    result = subprocess.run([codex, "mcp", "add", "qqmusic-mcp", "--", _command(), "stdio"])
     if result.returncode:
         print("Could not register Codex. Is codex available on PATH?", file=sys.stderr)
         return result.returncode
     print("Registered qqmusic-mcp with Codex using standard MCP stdio transport.")
     return 0
+
+
+def setup(args: argparse.Namespace) -> int:
+    login_result = login(argparse.Namespace(login_timeout=args.login_timeout, force=args.force_login))
+    if login_result:
+        return login_result
+    install_result = install(argparse.Namespace(client=args.client))
+    if install_result:
+        return install_result
+    return doctor(argparse.Namespace(client=args.client))
 
 
 def uninstall(args: argparse.Namespace) -> int:
@@ -313,12 +463,24 @@ def make_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("status", help="show background service status").set_defaults(func=status)
     subparsers.add_parser("stop", help="stop the managed background service").set_defaults(func=stop)
     subparsers.add_parser("logout", help="remove the encrypted QQ Music login cache").set_defaults(func=logout)
+    login_parser = subparsers.add_parser("login", help="log in before starting an MCP client")
+    login_parser.add_argument("--login-timeout", type=int, default=600)
+    login_parser.add_argument("--force", action="store_true", help="replace an existing saved login")
+    login_parser.set_defaults(func=login)
     install_parser = subparsers.add_parser("install", help="register this MCP with a client")
     install_parser.add_argument("--client", choices=["codex", "claude", "cursor", "vscode"], default="codex")
     install_parser.set_defaults(func=install)
     config_parser = subparsers.add_parser("config", help="print MCP client configuration JSON")
     config_parser.add_argument("--client", choices=["claude", "cursor", "vscode"], default="claude")
     config_parser.set_defaults(func=config)
+    setup_parser = subparsers.add_parser("setup", help="log in, register a client, and verify the installation")
+    setup_parser.add_argument("--client", choices=["codex", "claude", "cursor", "vscode"], default="codex")
+    setup_parser.add_argument("--login-timeout", type=int, default=600)
+    setup_parser.add_argument("--force-login", action="store_true")
+    setup_parser.set_defaults(func=setup)
+    doctor_parser = subparsers.add_parser("doctor", help="check the local installation and login")
+    doctor_parser.add_argument("--client", choices=["codex", "claude", "cursor", "vscode"], default="codex")
+    doctor_parser.set_defaults(func=doctor)
     uninstall_parser = subparsers.add_parser("uninstall", help="stop the service and remove Codex registration")
     uninstall_parser.add_argument("--purge", action="store_true", help="also remove the encrypted login cache")
     uninstall_parser.set_defaults(func=uninstall)

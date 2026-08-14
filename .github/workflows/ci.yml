@@ -23,3 +23,12 @@ jobs:
       - run: uv run pytest
       - run: uv build
       - run: uvx twine check dist/*
+      - name: Validate installer syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path install.ps1), [ref]$tokens, [ref]$errors
+          )
+          if ($errors.Count) { throw ($errors | Out-String) }

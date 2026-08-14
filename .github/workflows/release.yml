@@ -19,7 +19,25 @@ jobs:
       - run: uv run pytest
       - run: uv build
       - run: uvx twine check dist/*
+      - name: Validate tag and prepare release assets
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $version = uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
+          if ("v$version" -ne $env:RELEASE_TAG) {
+            throw "Tag $env:RELEASE_TAG does not match package version $version"
+          }
+          $wheels = @(Get-ChildItem dist -Filter '*.whl')
+          if ($wheels.Count -ne 1) { throw 'Expected exactly one wheel' }
+          $hash = (Get-FileHash -Algorithm SHA256 $wheels[0].FullName).Hash.ToLowerInvariant()
+          "$hash  $($wheels[0].Name)" | Set-Content -Encoding ascii "$($wheels[0].FullName).sha256"
+          Copy-Item install.ps1 dist\install.ps1
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/install.ps1
           generate_release_notes: true

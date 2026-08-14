@@ -237,32 +237,50 @@ AI 会调用 `qqmusic_search`，再根据返回的 MID 调用
 ## 环境要求
 
 - Windows 10 或 Windows 11
-- Python 3.11 或更高版本
-- [uv](https://docs.astral.sh/uv/getting-started/installation/)
 - 已安装 Chrome 或 Edge
 - 支持 MCP 的 AI 客户端
 
+自动安装脚本会准备 `uv` 和隔离的 Python 环境，不要求预先安装 Python 或 Node.js。
+
 ## 安装
 
-从 GitHub 安装为独立命令：
+推荐在 PowerShell 中运行自动安装脚本：
+
+```powershell
+irm https://github.com/baoozak/qqmusic-mcp/releases/latest/download/install.ps1 | iex
+```
+
+脚本会自动：
+
+1. 检查并安装 [uv](https://docs.astral.sh/uv/)。
+2. 下载最新 GitHub Release 的 wheel，并用随 Release 发布的 SHA-256 校验。
+3. 安装 `qqmusic-mcp`，将命令目录加入当前用户的 `PATH`。
+4. 让你选择 Codex、Claude Desktop、Cursor 或 VS Code。
+5. 打开 QQ 音乐登录窗口，将登录态用 Windows DPAPI 加密保存。
+6. 自动注册 Codex；Claude Desktop、Cursor 和 VS Code 会输出待合并的标准配置。
+7. 运行安装检查。
+
+脚本不读取或输出 Cookie。希望先审阅脚本时，可以下载后再运行：
+
+```powershell
+$installer = "$env:TEMP\qqmusic-mcp-install.ps1"
+irm https://github.com/baoozak/qqmusic-mcp/releases/latest/download/install.ps1 -OutFile $installer
+notepad $installer
+powershell -ExecutionPolicy Bypass -File $installer
+```
+
+### 手动安装
+
+已经安装 `uv` 时，也可以直接从 GitHub 安装，然后运行一次设置向导：
 
 ```powershell
 uv tool install "git+https://github.com/baoozak/qqmusic-mcp.git"
-qqmusic-mcp --help
+qqmusic-mcp setup --client codex
 ```
 
-仓库发布到 PyPI 后可直接使用：
+升级时重新运行安装脚本；卸载使用：
 
 ```powershell
-uv tool install qqmusic-mcp
-```
-
-发行包名和命令名统一为 `qqmusic-mcp`。
-
-升级或卸载：
-
-```powershell
-uv tool upgrade qqmusic-mcp
 uv tool uninstall qqmusic-mcp
 ```
 
@@ -272,10 +290,10 @@ uv tool uninstall qqmusic-mcp
 
 ### Codex
 
-自动注册：
+登录、自动注册并检查：
 
 ```powershell
-qqmusic-mcp install --client codex
+qqmusic-mcp setup --client codex
 codex mcp get qqmusic-mcp
 ```
 
@@ -287,10 +305,10 @@ codex mcp add qqmusic-mcp -- qqmusic-mcp stdio
 
 ### Claude Desktop
 
-生成配置：
+先登录并生成配置：
 
 ```powershell
-qqmusic-mcp config --client claude
+qqmusic-mcp setup --client claude
 ```
 
 将输出中的 `mcpServers` 合并到 Claude Desktop 配置文件。典型配置如下：
@@ -309,7 +327,7 @@ qqmusic-mcp config --client claude
 ### Cursor
 
 ```powershell
-qqmusic-mcp config --client cursor
+qqmusic-mcp setup --client cursor
 ```
 
 将输出合并到项目 `.cursor/mcp.json` 或 Cursor 的全局 MCP 配置。
@@ -317,7 +335,7 @@ qqmusic-mcp config --client cursor
 ### VS Code
 
 ```powershell
-qqmusic-mcp config --client vscode
+qqmusic-mcp setup --client vscode
 ```
 
 将输出保存或合并到 `.vscode/mcp.json`：
@@ -338,7 +356,7 @@ qqmusic-mcp config --client vscode
 
 ## 首次登录
 
-AI 客户端第一次调用 MCP 时，会打开一个隔离的 Chrome 窗口；Chrome 不可用时尝试 Edge。使用 QQ 或微信登录 QQ 音乐即可。检测到登录态后窗口自动关闭。
+自动安装脚本和 `qqmusic-mcp setup` 会在注册 MCP 客户端之前打开隔离的 Chrome 窗口；Chrome 不可用时尝试 Edge。使用 QQ 或微信登录 QQ 音乐即可，检测到登录态并完成服务端验证后窗口自动关闭。这样登录不会占用 MCP 的启动握手时间。
 
 登录 Cookie 不会以明文写入磁盘、日志或 MCP 响应。它通过 Windows DPAPI 加密保存到：
 
@@ -350,6 +368,13 @@ AI 客户端第一次调用 MCP 时，会打开一个隔离的 Chrome 窗口；C
 
 ```powershell
 qqmusic-mcp logout
+```
+
+需要重新登录或单独检查安装时：
+
+```powershell
+qqmusic-mcp login --force
+qqmusic-mcp doctor --client codex
 ```
 
 ## HTTP 模式
@@ -384,6 +409,9 @@ qqmusic-mcp serve --port 8765 --login-timeout 600
 qqmusic-mcp stdio                     标准 MCP stdio 服务
 qqmusic-mcp serve                     前台 HTTP 服务
 qqmusic-mcp start/status/stop         管理后台 HTTP 服务
+qqmusic-mcp login [--force]           登录并用 DPAPI 保存会话
+qqmusic-mcp setup --client <client>   登录、注册并检查安装
+qqmusic-mcp doctor --client <client>  检查命令、浏览器、登录和注册
 qqmusic-mcp install --client codex    注册 Codex MCP
 qqmusic-mcp config --client <client>  输出客户端配置
 qqmusic-mcp logout                    删除 DPAPI 登录缓存
@@ -434,7 +462,14 @@ Get-Command qqmusic-mcp
 qqmusic-mcp --help
 ```
 
-登录窗口被关闭：重新触发一次 MCP 调用，或执行 `qqmusic-mcp logout` 后重试。
+登录窗口被关闭或登录已失效：
+
+```powershell
+qqmusic-mcp login --force --login-timeout 600
+qqmusic-mcp doctor --client codex
+```
+
+命令在当前窗口找不到：安装器已更新当前用户的 `PATH`，请重新打开 PowerShell 后再运行 `qqmusic-mcp doctor`。
 
 HTTP 服务未就绪：
 
