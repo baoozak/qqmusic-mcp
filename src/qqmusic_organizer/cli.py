@@ -125,6 +125,9 @@ def _command() -> str:
     executable = Path(sys.argv[0]).resolve()
     if executable.exists() and executable.suffix.casefold() == ".exe":
         return str(executable)
+    launcher = Path(sys.executable).resolve().with_name("qqmusic-mcp.exe")
+    if launcher.exists():
+        return str(launcher)
     return shutil.which("qqmusic-mcp") or "qqmusic-mcp"
 
 

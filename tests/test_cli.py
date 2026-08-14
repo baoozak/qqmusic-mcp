@@ -17,6 +17,19 @@ def test_config_shapes(monkeypatch, capsys) -> None:
     assert vscode["servers"]["qqmusic-mcp"]["type"] == "stdio"
 
 
+def test_command_finds_launcher_next_to_python(monkeypatch, tmp_path) -> None:
+    scripts = tmp_path / "Scripts"
+    scripts.mkdir()
+    python = scripts / "python.exe"
+    launcher = scripts / "qqmusic-mcp.exe"
+    python.touch()
+    launcher.touch()
+    monkeypatch.setattr(cli.sys, "argv", ["qqmusic-mcp"])
+    monkeypatch.setattr(cli.sys, "executable", str(python))
+
+    assert cli._command() == str(launcher.resolve())
+
+
 def test_start_requires_http_token(monkeypatch, capsys) -> None:
     monkeypatch.delenv("QQMUSIC_ORGANIZER_TOKEN", raising=False)
     result = cli.start(Namespace(port=8765, login_timeout=300, wait=0))
