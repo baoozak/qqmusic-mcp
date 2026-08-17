@@ -24,10 +24,14 @@ real QQ Music Cookie or MCP bearer token.
   saved; the installer never receives or prints the Cookie.
 - A write probe must succeed before a plan can be applied.
 - Finalized plans are integrity checked with SHA-256.
+- Smart-playlist synchronization recomputes and verifies the preview SHA-256
+  before writing; any source or target change requires a new preview.
 - The liked playlist (`dirId=201`) is never a write or delete target.
 - Writes use batches of at most 20 songs and are read back for verification.
 - Generic playlist writes create a local operation log; deleting a playlist also
   requires it to be empty and is confirmed by a second playlist read.
+- Enriched song metadata and optional lyric excerpts are cached only in the
+  local application-data directory. Cache filenames use hashed song MIDs.
 
 This project uses unofficial QQ Music web APIs. Treat every upstream response
 as untrusted and stop writes if its shape changes.

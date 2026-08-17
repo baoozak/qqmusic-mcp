@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import secrets
 import csv
 import re
@@ -7,7 +8,7 @@ from collections import Counter
 from typing import Any
 
 from .models import Assignment, OrganizationPlan, RunRecord, SmartPlaylistBucket, SmartPlaylistRule, SongRecord, TaxonomyItem, utc_now
-from .qqmusic import QQMusicClient
+from .qqmusic import AuthenticationError, QQMusicClient, QQMusicError
 from .storage import Storage
 
 
@@ -114,6 +115,120 @@ class Organizer:
         if not songs:
             raise ValueError("smart playlist rule matched no songs")
         return await self._create_playlist_from_songs(name, songs)
+
+    async def preview_smart_playlist_sync(
+        self,
+        name: str,
+        source_directory_id: int,
+        rule: SmartPlaylistRule,
+        remove_extraneous: bool = False,
+    ) -> dict[str, Any]:
+        name = name.strip()
+        if not name or len(name) > 80:
+            raise ValueError("smart playlist name must contain 1-80 characters")
+        source = await self._playlist(source_directory_id)
+        if source.playlist_id is None:
+            raise RuntimeError("source playlist is not readable")
+        source_songs = await self.client.get_playlist_songs(source.playlist_id)
+        desired = self._filter_songs(source_songs, rule)
+        if not desired:
+            raise ValueError("smart playlist rule matched no songs")
+
+        matches = [
+            item
+            for item in await self.client.list_created_playlists()
+            if item.name.casefold() == name.casefold()
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(f"multiple created playlists have the exact name: {name}")
+        target = matches[0] if matches else None
+        if target and target.directory_id == 201:
+            raise PermissionError("the liked playlist can never be a smart-playlist target")
+        if target and target.playlist_id is None:
+            raise RuntimeError("target playlist is not readable")
+        current = await self.client.get_playlist_songs(target.playlist_id) if target else []
+
+        desired_by_mid = {song.mid: song for song in desired}
+        current_by_mid = {song.mid: song for song in current}
+        additions = [song for song in desired if song.mid not in current_by_mid]
+        removals = [song for song in current if remove_extraneous and song.mid not in desired_by_mid]
+        fingerprint = self.storage.canonical_hash(
+            {
+                "name": name,
+                "source_directory_id": source_directory_id,
+                "target_directory_id": target.directory_id if target else None,
+                "rule": rule.model_dump(mode="json"),
+                "remove_extraneous": remove_extraneous,
+                "desired_mids": [song.mid for song in desired],
+                "current_mids": [song.mid for song in current],
+            }
+        )
+        existing = self.storage.find_smart_playlist(name)
+        saved = self.storage.save_smart_playlist(
+            {
+                **(existing or {}),
+                "name": name,
+                "source_directory_id": source_directory_id,
+                "target_directory_id": target.directory_id if target else None,
+                "rule": rule.model_dump(mode="json"),
+                "remove_extraneous": remove_extraneous,
+                "preview_sha256": fingerprint,
+                "desired_count": len(desired),
+                "add_songs": [song.model_dump(mode="json") for song in additions],
+                "remove_songs": [song.model_dump(mode="json") for song in removals],
+            }
+        )
+        return {
+            "smart_playlist_id": saved["id"],
+            "name": name,
+            "source_directory_id": source_directory_id,
+            "target_directory_id": saved["target_directory_id"],
+            "preview_sha256": fingerprint,
+            "desired_count": len(desired),
+            "current_count": len(current),
+            "add_count": len(additions),
+            "remove_count": len(removals),
+            "remove_extraneous": remove_extraneous,
+            "add_songs": saved["add_songs"][:200],
+            "remove_songs": saved["remove_songs"][:200],
+            "preview_truncated": len(additions) > 200 or len(removals) > 200,
+        }
+
+    async def apply_smart_playlist_sync(self, smart_playlist_id: str, preview_sha256: str) -> dict[str, Any]:
+        saved = self.storage.load_smart_playlist(smart_playlist_id)
+        fresh = await self.preview_smart_playlist_sync(
+            saved["name"],
+            int(saved["source_directory_id"]),
+            SmartPlaylistRule.model_validate(saved["rule"]),
+            bool(saved.get("remove_extraneous", False)),
+        )
+        if not secrets.compare_digest(fresh["preview_sha256"], preview_sha256):
+            raise RuntimeError("smart-playlist contents changed after preview; review the new preview before applying")
+        self._require_write_capability()
+
+        directory_id = fresh["target_directory_id"]
+        if directory_id is None:
+            directory_id = (await self.create_playlist(saved["name"]))["directory_id"]
+        verified = self.storage.load_smart_playlist(smart_playlist_id)
+        additions = [SongRecord.model_validate(song) for song in verified["add_songs"]]
+        removals = [SongRecord.model_validate(song) for song in verified["remove_songs"]]
+        for start in range(0, len(additions), 20):
+            await self.add_songs(directory_id, additions[start : start + 20])
+        for start in range(0, len(removals), 20):
+            await self.remove_songs(directory_id, removals[start : start + 20])
+
+        completed = self.storage.load_smart_playlist(smart_playlist_id)
+        completed["target_directory_id"] = directory_id
+        completed["last_applied_preview_sha256"] = preview_sha256
+        completed["last_applied_at"] = utc_now()
+        self.storage.save_smart_playlist(completed)
+        return {
+            "smart_playlist_id": smart_playlist_id,
+            "directory_id": directory_id,
+            "added": len(additions),
+            "removed": len(removals),
+            "synchronized": True,
+        }
 
     async def merge_playlists(self, name: str, source_directory_ids: list[int]) -> dict[str, Any]:
         if len(source_directory_ids) < 2 or len(source_directory_ids) > 20:
@@ -226,9 +341,125 @@ class Organizer:
             "path": str(path),
         }
 
+    async def prepare_incremental_organization(self, baseline_export_id: str | None = None) -> dict[str, Any]:
+        baseline = self.storage.load_export(baseline_export_id) if baseline_export_id else self.storage.latest_full_export()
+        liked, current_songs = await self.client.export_liked()
+        current_export_id, current_path = self.storage.save_export(current_songs)
+        if baseline is None:
+            return {
+                "baseline_initialized": True,
+                "current_export_id": current_export_id,
+                "current_count": len(current_songs),
+                "playlist_name": liked.name or "我喜欢",
+                "path": str(current_path),
+                "added_count": 0,
+                "removed_count": 0,
+                "incremental_export_id": None,
+            }
+        if baseline.get("snapshot_type", "full") != "full":
+            raise ValueError("incremental organization requires a full liked-library export as its baseline")
+
+        baseline_by_mid = {song["mid"]: song for song in baseline["songs"]}
+        current_by_mid = {song.mid: song for song in current_songs}
+        additions = [song for song in current_songs if song.mid not in baseline_by_mid]
+        removals = [song for mid, song in baseline_by_mid.items() if mid not in current_by_mid]
+        incremental_export_id = None
+        incremental_path = None
+        if additions:
+            incremental_export_id, incremental_path = self.storage.save_export(
+                additions,
+                snapshot_type="incremental",
+                metadata={"baseline_export_id": baseline["id"], "current_export_id": current_export_id},
+            )
+        return {
+            "baseline_initialized": False,
+            "baseline_export_id": baseline["id"],
+            "current_export_id": current_export_id,
+            "incremental_export_id": incremental_export_id,
+            "added_count": len(additions),
+            "removed_count": len(removals),
+            "removed_songs": removals[:200],
+            "removed_songs_truncated": len(removals) > 200,
+            "incremental_path": str(incremental_path) if incremental_path else None,
+            "next_step": (
+                "create an organization plan from incremental_export_id"
+                if incremental_export_id
+                else "no newly liked songs need organization"
+            ),
+        }
+
+    async def enrich_export_page(
+        self,
+        export_id: str,
+        page: int = 1,
+        page_size: int = 20,
+        include_lyrics: bool = False,
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
+        if page_size > 50:
+            raise ValueError("metadata enrichment page_size must be 1-50")
+        exported = self.export_page(export_id, page, page_size)
+        semaphore = asyncio.Semaphore(5)
+
+        async def enrich(song_data: dict[str, Any]) -> dict[str, Any]:
+            song = SongRecord.model_validate(song_data)
+            cached = None if force_refresh else self.storage.load_metadata(song.mid)
+            if cached is not None and (not include_lyrics or "lyrics_excerpt" in cached):
+                return {**cached, "song": song.model_dump(mode="json")}
+            try:
+                async with semaphore:
+                    detail = await self.client.get_song_detail(song.mid)
+            except AuthenticationError:
+                raise
+            except QQMusicError as error:
+                return {"song": song.model_dump(mode="json"), "metadata_error": type(error).__name__}
+            lyrics_excerpt = None
+            lyrics_error = None
+            if include_lyrics:
+                try:
+                    async with semaphore:
+                        lyrics = (await self.client.get_lyrics(song.mid)).get("lyric", "")
+                    lyrics_excerpt = re.sub(r"\[[^\]]+\]", "", lyrics).strip()[:1200]
+                except AuthenticationError:
+                    raise
+                except QQMusicError as error:
+                    lyrics_error = type(error).__name__
+            track = detail.get("track_info") if isinstance(detail.get("track_info"), dict) else detail
+            singers = track.get("singer") if isinstance(track, dict) else None
+            album = track.get("album") if isinstance(track, dict) else None
+            title = str(track.get("title") or track.get("name") or song.name) if isinstance(track, dict) else song.name
+            tags = [
+                label
+                for token, label in (("live", "live"), ("remix", "remix"), ("伴奏", "instrumental"), ("纯音乐", "instrumental"))
+                if token in title.casefold()
+            ]
+            publish_date = (track.get("time_public") or track.get("publish_date")) if isinstance(track, dict) else None
+            normalized = {
+                "song": song.model_dump(mode="json"),
+                "title": title,
+                "singers": [str(item.get("name")) for item in singers if isinstance(item, dict) and item.get("name")]
+                if isinstance(singers, list)
+                else song.singers,
+                "album": str(album.get("name") or song.album) if isinstance(album, dict) else song.album,
+                "publish_date": publish_date,
+                "release_year": int(str(publish_date)[:4]) if str(publish_date)[:4].isdigit() else None,
+                "language": (track.get("language") or track.get("lan")) if isinstance(track, dict) else None,
+                "genre": track.get("genre") if isinstance(track, dict) else None,
+                "bpm": track.get("bpm") if isinstance(track, dict) else None,
+                "version": (track.get("version") or track.get("subtitle")) if isinstance(track, dict) else None,
+                "tags": sorted(set(tags)),
+            }
+            if include_lyrics:
+                normalized["lyrics_excerpt"] = lyrics_excerpt
+                if lyrics_error:
+                    normalized["lyrics_error"] = lyrics_error
+            return self.storage.save_metadata(song.mid, normalized)
+
+        enriched = await asyncio.gather(*(enrich(song) for song in exported["songs"]))
+        return {**{key: value for key, value in exported.items() if key != "songs"}, "songs": enriched}
+
     def export_summary(self, export_id: str) -> dict[str, Any]:
-        directory = self.storage.exports / export_id
-        return self.storage.read_json(directory / "summary.json")
+        return self.storage.load_export_summary(export_id)
 
     def export_page(self, export_id: str, page: int = 1, page_size: int = 100) -> dict[str, Any]:
         if page < 1 or page_size < 1 or page_size > 200:

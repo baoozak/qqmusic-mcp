@@ -8,9 +8,10 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from qqmusic_organizer.models import Assignment, SmartPlaylistBucket, SongRecord, TaxonomyItem
+from qqmusic_organizer.models import Assignment, SmartPlaylistBucket, SmartPlaylistRule, SongRecord, TaxonomyItem
 from qqmusic_organizer.organizer import Organizer
 from qqmusic_organizer.qqmusic import ProtocolChangedError, QQMusicClient, normalized_uin, parse_cookie
+from qqmusic_organizer.server import build_mcp
 from qqmusic_organizer.session_cache import delete_cookie, load_cookie, save_cookie
 from qqmusic_organizer.storage import Storage
 
@@ -168,6 +169,11 @@ class FakeWriteClient:
         self.contents: dict[int, set[str]] = {999: {"MID1", "MID2"}, 9001: {"MID1"}}
         self.removed: list[tuple[int, list[int]]] = []
         self.deleted: list[int] = []
+        self.liked_songs = [
+            SongRecord(mid="MID1", song_id=1, song_type=0, name="MID1"),
+            SongRecord(mid="MID2", song_id=2, song_type=1, name="MID2"),
+        ]
+        self.detail_calls = 0
 
     async def list_created_playlists(self):
         return list(self.playlists)
@@ -178,10 +184,23 @@ class FakeWriteClient:
     async def export_liked(self):
         from qqmusic_organizer.qqmusic import Playlist
 
-        return Playlist(201, 999, "我喜欢", 2), [
-            SongRecord(mid="MID1", song_id=1, song_type=0, name="MID1"),
-            SongRecord(mid="MID2", song_id=2, song_type=1, name="MID2"),
-        ]
+        return Playlist(201, 999, "我喜欢", len(self.liked_songs)), list(self.liked_songs)
+
+    async def get_song_detail(self, mid: str):
+        self.detail_calls += 1
+        return {
+            "track_info": {
+                "mid": mid,
+                "title": f"{mid} Live",
+                "singer": [{"name": "测试歌手"}],
+                "album": {"name": "测试专辑"},
+                "time_public": "2025-01-01",
+                "language": "国语",
+            }
+        }
+
+    async def get_lyrics(self, mid: str):
+        return {"lyric": f"[00:01.00]{mid} 歌词"}
 
     async def create_playlist(self, name: str):
         from qqmusic_organizer.qqmusic import Playlist
@@ -202,7 +221,7 @@ class FakeWriteClient:
     async def remove_songs(self, directory_id: int, songs: list[SongRecord]):
         self.removed.append((directory_id, [song.song_id or 0 for song in songs]))
         playlist = next(item for item in self.playlists if item.directory_id == directory_id)
-        self.contents[playlist.playlist_id or 0].clear()
+        self.contents[playlist.playlist_id or 0].difference_update(song.mid for song in songs)
 
     async def delete_playlist(self, directory_id: int):
         self.deleted.append(directory_id)
@@ -289,6 +308,81 @@ async def test_library_analysis_and_smart_workflows(tmp_path: Path) -> None:
     assert len(split["created"]) == 2
     with pytest.raises(ValueError, match="multiple buckets"):
         await organizer.split_playlist(201, [SmartPlaylistBucket(name="重复", song_mids=["MID1"]), SmartPlaylistBucket(name="重复2", song_mids=["MID1"])])
+
+
+@pytest.mark.anyio
+async def test_smart_playlist_sync_requires_matching_preview(tmp_path: Path) -> None:
+    storage = Storage(tmp_path)
+    client = FakeWriteClient()
+    organizer = Organizer(client=client, storage=storage)  # type: ignore[arg-type]
+    storage.set_write_capability(True, "test")
+
+    preview = await organizer.preview_smart_playlist_sync(
+        "夜晚",
+        201,
+        SmartPlaylistRule(keyword="MID"),
+    )
+    assert preview["add_count"] == 1
+    assert preview["remove_count"] == 0
+    result = await organizer.apply_smart_playlist_sync(
+        preview["smart_playlist_id"],
+        preview["preview_sha256"],
+    )
+    assert result["added"] == 1
+    assert client.contents[9001] == {"MID1", "MID2"}
+
+    stale = await organizer.preview_smart_playlist_sync(
+        "夜晚",
+        201,
+        SmartPlaylistRule(keyword="MID"),
+        remove_extraneous=True,
+    )
+    client.contents[9001].add("UNEXPECTED")
+    with pytest.raises(RuntimeError, match="changed after preview"):
+        await organizer.apply_smart_playlist_sync(stale["smart_playlist_id"], stale["preview_sha256"])
+
+
+@pytest.mark.anyio
+async def test_incremental_export_is_plan_ready(tmp_path: Path) -> None:
+    storage = Storage(tmp_path)
+    baseline_id, _ = storage.save_export([SongRecord(mid="MID1", song_id=1, name="MID1")])
+    client = FakeWriteClient()
+    organizer = Organizer(client=client, storage=storage)  # type: ignore[arg-type]
+
+    result = await organizer.prepare_incremental_organization(baseline_id)
+    assert result["added_count"] == 1
+    assert result["removed_count"] == 0
+    delta = storage.load_export(result["incremental_export_id"])
+    assert delta["snapshot_type"] == "incremental"
+    assert [song["mid"] for song in delta["songs"]] == ["MID2"]
+    assert organizer.create_plan(result["incremental_export_id"]).export_id == result["incremental_export_id"]
+
+
+@pytest.mark.anyio
+async def test_export_metadata_enrichment_uses_cache(tmp_path: Path) -> None:
+    storage = Storage(tmp_path)
+    export_id, _ = storage.save_export([SongRecord(mid="MID1", song_id=1, name="MID1")])
+    client = FakeWriteClient()
+    organizer = Organizer(client=client, storage=storage)  # type: ignore[arg-type]
+
+    first = await organizer.enrich_export_page(export_id, include_lyrics=True)
+    second = await organizer.enrich_export_page(export_id, include_lyrics=True)
+    assert client.detail_calls == 1
+    assert first["songs"][0]["language"] == "国语"
+    assert first["songs"][0]["release_year"] == 2025
+    assert first["songs"][0]["tags"] == ["live"]
+    assert first["songs"][0]["lyrics_excerpt"] == "MID1 歌词"
+    assert second["songs"][0]["mid"] == "MID1"
+
+
+@pytest.mark.anyio
+async def test_mcp_tools_expose_safety_annotations(tmp_path: Path) -> None:
+    organizer = Organizer(client=FakeWriteClient(), storage=Storage(tmp_path))  # type: ignore[arg-type]
+    tools = {tool.name: tool for tool in await build_mcp(organizer).list_tools()}
+    assert len(tools) == 34
+    assert tools["qqmusic_status"].annotations.readOnlyHint is True
+    assert tools["qqmusic_create_playlist"].annotations.destructiveHint is False
+    assert tools["qqmusic_apply_smart_playlist_sync"].annotations.destructiveHint is True
 
 
 @pytest.mark.anyio
