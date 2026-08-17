@@ -1,6 +1,6 @@
 [project]
 name = "qqmusic-mcp"
-version = "1.0.0"
+version = "1.1.0"
 description = "A local MCP server for safely managing a QQ Music personal library"
 readme = "README.md"
 license = "MIT"
